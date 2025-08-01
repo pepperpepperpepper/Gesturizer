@@ -63,7 +63,7 @@ class TouchListener:
         self.SCRUB_MIN_VERTICAL_PERCENT = 20.0  # Percent of screen height for total vertical travel
         # Pinch detection parameters
         self.PINCH_MIN_FINGERS = 2
-        self.PINCH_MAX_FINGERS = 2
+        self.PINCH_MAX_FINGERS = 3  # Support up to 3 fingers
         self.PINCH_MIN_CHANGE_PERCENT = 20.0  # Minimum percentage change in distance for pinch
         self.PINCH_DIRECTION_ANGLE_TOLERANCE = 45  # Degrees; tolerance for opposing directions (e.g., 180° ±45° for pinch)
         self.pinch_data = {
@@ -295,7 +295,178 @@ class TouchListener:
                         hold_duration = current_time - self.gesture_hold_state['start_time']
                         hold_duration_ms = hold_duration * 1000
                         
-                        effective_hold_timeout = self.TAP_HOLD_TIMEOUT if len(self.active_slots) != 2 else self.TAP_HOLD_TIMEOUT * 0.8  # 20% shorter for 2 fingers to avoid slow pinch conflicts
+                        effective_hold_timeout = self.TAP_HOLD_TIMEOUT if len(self.active_slots) < 2 or len(self.active_slots) > self.PINCH_MAX_FINGERS else self.TAP_HOLD_TIMEOUT * 0.8  # 20% shorter for 2 fingers to avoid slow pinch conflicts
+                        if hold_duration_ms >= effective_hold_timeout:
+                            all_fingers_stable = True
+                            for slot in list(self.active_slots):
+                                if slot in self.fingers:
+                                    sx, sy, ex, ey, st = self.fingers[slot]
+                                    movement = math.sqrt((ex - sx)**2 + (ey - sy)**2)
+                                    if movement > self.TAP_HOLD_MAX_MOVEMENT:
+                                        all_fingers_stable = False
+                                        break
+                            
+                            if all_fingers_stable:
+                                self.gesture_hold_state['is_hold'] = True
+                                self.gesture_hold_state['notified'] = True
+                                self._handle_hold_start()
+                                print(f"🔍 DEBUG: Hold confirmed, duration={hold_duration_ms:.0f}ms, stable={all_fingers_stable}")
+                            else:
+                                self.gesture_hold_state['is_hold'] = False
+                                print(f"🔍 DEBUG: Hold rejected due to movement, duration={hold_duration_ms:.0f}ms, stable={all_fingers_stable}")
+                    
+                    # Track pinch distance in real-time
+                    if len(self.active_slots) >= self.PINCH_MIN_FINGERS and len(self.active_slots) <= self.PINCH_MAX_FINGERS and not self.pinch_data['is_active']:
+                        current_distance = self._calculate_distance()
+                        if current_distance > 0:
+                            slots = list(self.active_slots)
+                            self.pinch_data['initial_distance'] = current_distance
+                            self.pinch_data['min_distance'] = current_distance
+                            self.pinch_data['max_distance'] = current_distance
+                            self.pinch_data['is_active'] = True
+                            finger_desc = "fingers" if len(slots) > 2 else "finger"
+                            print(f"🔍 DEBUG: Pinch tracking started - {len(slots)} {finger_desc}, initial_distance={current_distance:.1f}")
+                    elif (len(self.active_slots) < self.PINCH_MIN_FINGERS or len(self.active_slots) > self.PINCH_MAX_FINGERS) and self.pinch_data['is_active']:
+                        self.pinch_data['is_active'] = False
+                        print("🔍 DEBUG: Pinch tracking stopped due to finger count change")
+                    if len(self.active_slots) >= self.PINCH_MIN_FINGERS and len(self.active_slots) <= self.PINCH_MAX_FINGERS and self.pinch_data['is_active']:
+                        current_distance = self._calculate_distance()
+                        if current_distance > 0:
+                            old_min = self.pinch_data['min_distance']
+                            old_max = self.pinch_data['max_distance']
+                            self.pinch_data['min_distance'] = min(old_min, current_distance)
+                            self.pinch_data['max_distance'] = max(old_max, current_distance)
+                            if self.pinch_data['min_distance'] != old_min or self.pinch_data['max_distance'] != old_max:
+                                print(f"🔍 DEBUG: Distance updated - current={current_distance:.1f}, min={self.pinch_data['min_distance']:.1f}, max={self.pinch_data['max_distance']:.1f}")
+                    
+                    # Clear batch
+                    event_batch = []
+            for event in self.device.read_loop():
+                if not self.running:
+                    break
+                
+                event_batch.append(event)
+                
+                if event.type == ecodes.EV_SYN and event.code == ecodes.SYN_REPORT:
+                    # Process the batch of events
+                    for ev in event_batch:
+                        if ev.type == ecodes.EV_ABS:
+                            if ev.code == ecodes.ABS_MT_SLOT:
+                                current_slot = ev.value
+                            elif ev.code == ecodes.ABS_MT_TRACKING_ID:
+                                slot = current_slot
+                                if ev.value == -1:
+                                    # Finger lifted
+                                    if slot in self.fingers:
+                                        # Remove from slot-level hold tracking
+                                        if slot in self.active_holds:
+                                            del self.active_holds[slot]
+                                        
+                                        if slot in self.active_slots:
+                                            self.active_slots.remove(slot)
+                                        
+                                        if not self.active_slots:
+                                            print(f"🔍 DEBUG: All fingers lifted, active_slots empty, is_hold={self.gesture_hold_state['is_hold']}")
+                                            if self.gesture_hold_state['is_hold']:
+                                                self._handle_hold_end()
+                                            else:
+                                                self._process_gesture()
+                                            self.fingers.clear()
+                                            self.active_slots.clear()
+                                            # Reset gesture hold state
+                                            self.gesture_hold_state = {
+                                                'is_hold': False,
+                                                'start_time': 0,
+                                                'notified': False,
+                                                'start_positions': []
+                                            }
+                                            self.pinch_data = {
+                                                'initial_distance': 0.0,
+                                                'min_distance': float('inf'),
+                                                'max_distance': 0.0,
+                                                'is_active': False
+                                            }
+                                else:
+                                    # Finger placed
+                                    slot_data[slot] = {'x': 0, 'y': 0}  # Always reset for new touch
+                                    self.fingers[slot] = (0, 0, 0, 0, time.time())
+                                    self.active_slots.add(slot)
+                                    
+                                    # Initialize gesture hold state if this is the first finger
+                                    if len(self.active_slots) == 1:
+                                        self.gesture_hold_state = {
+                                            'is_hold': False,
+                                            'start_time': time.time(),
+                                            'notified': False,
+                                            'start_positions': []
+                                        }
+                                        # First finger touched, initializing hold state
+                                    else:
+                                        print(f"🔍 Additional finger touched, total fingers: {len(self.active_slots)}")
+                                    
+                                    # Start tracking for potential hold (per slot)
+                                    self.active_holds[slot] = {
+                                        'start_time': time.time(),
+                                        'start_x': 0,
+                                        'start_y': 0,
+                                        'notified': False
+                                    }
+                            elif ev.code == ecodes.ABS_MT_POSITION_X:
+                                slot = current_slot
+                                if slot in slot_data:
+                                    slot_data[slot]['x'] = ev.value
+                                    if slot in self.fingers:
+                                        sx, sy, _, _, st = self.fingers[slot]
+                                        if sx == 0:
+                                            current_y = slot_data[slot].get('y', 0)
+                                            self.fingers[slot] = (ev.value, current_y, ev.value, current_y, st)
+                                            print(f"🔍 DEBUG: Initial X for slot {slot}: start=({ev.value}, {current_y}), end= same")
+                                        else:
+                                            new_ex = ev.value
+                                            new_ey = slot_data[slot]['y']
+                                            self.fingers[slot] = (sx, sy, new_ex, new_ey, st)
+                                            self._track_motion(slot, new_ex, new_ey)
+                                            print(f"🔍 DEBUG: Updated X for slot {slot}: start=({sx}, {sy}), end=({new_ex}, {new_ey})")
+                                    if slot in self.active_holds:
+                                        if self.active_holds[slot]['start_x'] == 0:
+                                            self.active_holds[slot]['start_x'] = ev.value
+                                        else:
+                                            movement = abs(ev.value - self.active_holds[slot]['start_x'])
+                                            if movement > self.TAP_HOLD_MAX_MOVEMENT and not self.active_holds[slot]['notified']:
+                                                del self.active_holds[slot]
+                                                print(f"🔍 DEBUG: Removed hold tracking for slot {slot} due to X movement: {movement} > {self.TAP_HOLD_MAX_MOVEMENT}")
+                            elif ev.code == ecodes.ABS_MT_POSITION_Y:
+                                slot = current_slot
+                                if slot in slot_data:
+                                    slot_data[slot]['y'] = ev.value
+                                    if slot in self.fingers:
+                                        sx, sy, _, _, st = self.fingers[slot]
+                                        if sy == 0:
+                                            current_x = slot_data[slot].get('x', 0)
+                                            self.fingers[slot] = (current_x, ev.value, current_x, ev.value, st)
+                                            print(f"🔍 DEBUG: Initial Y for slot {slot}: start=({current_x}, {ev.value}), end= same")
+                                        else:
+                                            new_ex = slot_data[slot]['x']
+                                            new_ey = ev.value
+                                            self.fingers[slot] = (sx, sy, new_ex, new_ey, st)
+                                            self._track_motion(slot, new_ex, new_ey)
+                                            print(f"🔍 DEBUG: Updated Y for slot {slot}: start=({sx}, {sy}), end=({new_ex}, {new_ey})")
+                                    if slot in self.active_holds:
+                                        if self.active_holds[slot]['start_y'] == 0:
+                                            self.active_holds[slot]['start_y'] = ev.value
+                                        else:
+                                            movement = abs(ev.value - self.active_holds[slot]['start_y'])
+                                            if movement > self.TAP_HOLD_MAX_MOVEMENT and not self.active_holds[slot]['notified']:
+                                                del self.active_holds[slot]
+                                                print(f"🔍 DEBUG: Removed hold tracking for slot {slot} due to Y movement: {movement} > {self.TAP_HOLD_MAX_MOVEMENT}")
+                    
+                    # After processing batch, check for hold
+                    current_time = time.time()
+                    if self.gesture_hold_state['start_time'] > 0 and not self.gesture_hold_state['notified']:
+                        hold_duration = current_time - self.gesture_hold_state['start_time']
+                        hold_duration_ms = hold_duration * 1000
+                        
+                        effective_hold_timeout = self.TAP_HOLD_TIMEOUT if len(self.active_slots) < 2 or len(self.active_slots) > self.PINCH_MAX_FINGERS else self.TAP_HOLD_TIMEOUT * 0.8  # 20% shorter for 2 fingers to avoid slow pinch conflicts
                         if hold_duration_ms >= effective_hold_timeout:
                             all_fingers_stable = True
                             for slot in list(self.active_slots):
@@ -334,6 +505,21 @@ class TouchListener:
                             self.pinch_data['is_active'] = True
                             print(f"🔍 DEBUG: Pinch tracking started - slots={slots}, pos1=({self.fingers[slots[0]][2]}, {self.fingers[slots[0]][3]}), pos2=({self.fingers[slots[1]][2]}, {self.fingers[slots[1]][3]}), initial_distance={current_distance:.1f}")
                     # Track pinch distance in real-time
+                    # Track pinch distance in real-time
+                    if len(self.active_slots) >= self.PINCH_MIN_FINGERS and len(self.active_slots) <= self.PINCH_MAX_FINGERS and self.pinch_data['is_active']:
+                        current_distance = self._calculate_distance()
+                        if current_distance > 0:
+                            old_min = self.pinch_data['min_distance']
+                            old_max = self.pinch_data['max_distance']
+                            self.pinch_data['min_distance'] = min(old_min, current_distance)
+                            self.pinch_data['max_distance'] = max(old_max, current_distance)
+                            if self.pinch_data['min_distance'] != old_min or self.pinch_data['max_distance'] != old_max:
+                                print(f"🔍 DEBUG: Distance updated - current={current_distance:.1f}, min={self.pinch_data['min_distance']:.1f}, max={self.pinch_data['max_distance']:.1f}")
+                    elif (len(self.active_slots) < self.PINCH_MIN_FINGERS or len(self.active_slots) > self.PINCH_MAX_FINGERS) and self.pinch_data['is_active']:
+                        self.pinch_data['is_active'] = False
+                        print("🔍 DEBUG: Pinch tracking stopped due to finger count change")
+                    
+                    # Track pinch distance in real-time
                     if len(self.active_slots) == self.PINCH_MIN_FINGERS and self.pinch_data['is_active']:
                         current_distance = self._calculate_distance()
                         if current_distance > 0:
@@ -343,9 +529,6 @@ class TouchListener:
                             self.pinch_data['max_distance'] = max(old_max, current_distance)
                             if self.pinch_data['min_distance'] != old_min or self.pinch_data['max_distance'] != old_max:
                                 print(f"🔍 DEBUG: Distance updated - current={current_distance:.1f}, min={self.pinch_data['min_distance']:.1f}, max={self.pinch_data['max_distance']:.1f}")
-                    elif self.pinch_data['is_active']:
-                        self.pinch_data['is_active'] = False
-                        print("🔍 DEBUG: Pinch tracking stopped due to finger count change")
                     
                     # Clear batch
                     event_batch = []        
@@ -367,51 +550,107 @@ class TouchListener:
             move = math.sqrt((ex-sx)**2 + (ey-sy)**2)
             max_move = max(max_move, move)
         
-        # Check for pinch first (two-finger specific) with vector checks
+        # Check for pinch with vector checks (supports 2 and 3 fingers)
         is_pinch = False
         pinch_type = None
-        if finger_count == self.PINCH_MIN_FINGERS and self.pinch_data['initial_distance'] > 0:
-            # Get slots and compute vectors
+        final_distance = 0.0
+        pinch_zoom_direction = None
+        
+        if finger_count >= self.PINCH_MIN_FINGERS and finger_count <= self.PINCH_MAX_FINGERS and self.pinch_data['initial_distance'] > 0:
             slots = list(self.fingers.keys())
-            sx1, sy1, ex1, ey1, _ = self.fingers[slots[0]]
-            sx2, sy2, ex2, ey2, _ = self.fingers[slots[1]]
-            vec1 = (ex1 - sx1, ey1 - sy1)
-            vec2 = (ex2 - sx2, ey2 - sy2)
             
-            # Compute angles
-            angle1 = math.degrees(math.atan2(vec1[1], vec1[0]))
-            angle2 = math.degrees(math.atan2(vec2[1], vec2[0]))
-            angle_diff = abs(angle1 - angle2)
-            if angle_diff > 180:
-                angle_diff = 360 - angle_diff
+            if finger_count == 2:
+                # 2-finger pinch: check if vectors are opposing
+                sx1, sy1, ex1, ey1, _ = self.fingers[slots[0]]
+                sx2, sy2, ex2, ey2, _ = self.fingers[slots[1]]
+                vec1 = (ex1 - sx1, ey1 - sy1)
+                vec2 = (ex2 - sx2, ey2 - sy2)
+                
+                # Compute angles
+                angle1 = math.degrees(math.atan2(vec1[1], vec1[0]))
+                angle2 = math.degrees(math.atan2(vec2[1], vec2[0]))
+                angle_diff = abs(angle1 - angle2)
+                if angle_diff > 180:
+                    angle_diff = 360 - angle_diff
+                
+                # Check if directions are opposing (for pinch)
+                directions_opposing = abs(angle_diff - 180) <= self.PINCH_DIRECTION_ANGLE_TOLERANCE
+                
+                # Compute distance change
+                final_distance = math.sqrt((ex1 - ex2)**2 + (ey1 - ey2)**2)
+                pinch_zoom_direction = None  # Not used for 2-finger
+                
+            elif finger_count == 3:
+                # 3-finger pinch: check if all fingers are moving toward/away from center
+                positions = [(self.fingers[slot][2], self.fingers[slot][3]) for slot in slots]
+                start_positions = [(self.fingers[slot][0], self.fingers[slot][1]) for slot in slots]
+                
+                # Calculate center of triangle
+                center_x = sum(x for x, y in positions) / 3
+                center_y = sum(y for x, y in positions) / 3
+                start_center_x = sum(x for x, y in start_positions) / 3
+                start_center_y = sum(y for x, y in start_positions) / 3
+                
+                # Check if all fingers are moving toward or away from center
+                all_converging = True
+                all_diverging = True
+                
+                # Calculate the average distance from center for start and end positions
+                start_avg_distance = 0
+                end_avg_distance = 0
+                
+                for i, (sx, sy, ex, ey, _) in enumerate([self.fingers[slot] for slot in slots]):
+                    # Vector from start to end position
+                    dx = ex - sx
+                    dy = ey - sy
+                    
+                    # Vector from start position to center
+                    start_vec_x = start_center_x - start_positions[i][0]
+                    start_vec_y = start_center_y - start_positions[i][1]
+                    
+                    # Vector from end position to center
+                    end_vec_x = center_x - positions[i][0]
+                    end_vec_y = center_y - positions[i][1]
+                    
+                    # Check dot product to see if moving toward/away from center
+                    if dx * start_vec_x + dy * start_vec_y < 0:
+                        all_converging = False
+                    if dx * start_vec_x + dy * start_vec_y > 0:
+                        all_diverging = False
+                    
+                    # Calculate distances from center
+                    start_avg_distance += math.sqrt((start_positions[i][0] - start_center_x)**2 + 
+                                                 (start_positions[i][1] - start_center_y)**2)
+                    end_avg_distance += math.sqrt((positions[i][0] - center_x)**2 + 
+                                               (positions[i][1] - center_y)**2)
+                
+                start_avg_distance /= 3
+                end_avg_distance /= 3
+                
+                directions_opposing = all_converging or all_diverging
+                final_distance = self._calculate_distance()
+                
+                # Use the average distance from center to determine zoom direction
+                # This is more reliable than the pairwise distance for 3 fingers
+                if end_avg_distance > start_avg_distance:
+                    pinch_zoom_direction = 'ZOOM_OUT'
+                else:
+                    pinch_zoom_direction = 'ZOOM_IN'
             
-            # Check if directions are opposing (for pinch)
-            directions_opposing = abs(angle_diff - 180) <= self.PINCH_DIRECTION_ANGLE_TOLERANCE
-            
-            # Check if directions are parallel (for swipe differentiation)
-            directions_parallel = angle_diff <= self.PINCH_DIRECTION_ANGLE_TOLERANCE or abs(angle_diff - 360) <= self.PINCH_DIRECTION_ANGLE_TOLERANCE
-            
-            # Compute distance change
-            final_distance = math.sqrt((ex1 - ex2)**2 + (ey1 - ey2)**2)
             distance_change = abs(self.pinch_data['max_distance'] - self.pinch_data['min_distance'])
             min_change = self.pinch_data['initial_distance'] * (self.PINCH_MIN_CHANGE_PERCENT / 100)
-            print(f"🔍 DEBUG: At gesture end - initial={self.pinch_data['initial_distance']:.1f}, min={self.pinch_data['min_distance']:.1f}, max={self.pinch_data['max_distance']:.1f}, final={final_distance:.1f}")
             
-            if distance_change >= min_change and directions_opposing and not directions_parallel:
+            if distance_change >= min_change and directions_opposing:
                 is_pinch = True
-                # Debug distances before classification
-                print(f"🔍 DEBUG: Initial distance: {self.pinch_data['initial_distance']:.1f}, Final distance: {final_distance:.1f}, Change: {distance_change:.1f} (min required: {min_change:.1f})")
-                if final_distance > self.pinch_data['initial_distance']:
-                    pinch_type = 'ZOOM_IN'
+                if finger_count == 3:
+                    # Use the more reliable direction determined from center distances
+                    pinch_type = pinch_zoom_direction
                 else:
-                    pinch_type = 'ZOOM_OUT'
-                print(f"🔍 DEBUG: Classification: {pinch_type} based on final ({final_distance:.1f}) {'>' if pinch_type == 'ZOOM_IN' else '<'} initial ({self.pinch_data['initial_distance']:.1f})")
-                # Debug vector info
-                print(f"🔍 DEBUG: Pinch detected - vec1=({vec1[0]:.1f}, {vec1[1]:.1f}) angle={angle1:.1f}°, vec2=({vec2[0]:.1f}, {vec2[1]:.1f}) angle={angle2:.1f}°, diff={angle_diff:.1f}°")
-            elif directions_parallel:
-                # Fall back to swipe if parallel
-                is_pinch = False
-                print(f"🔍 DEBUG: Parallel movements detected - treating as swipe, angle_diff={angle_diff:.1f}°")
+                    # 2-finger pinch uses distance comparison
+                    if final_distance > self.pinch_data['initial_distance']:
+                        pinch_type = 'ZOOM_IN'
+                    else:
+                        pinch_type = 'ZOOM_OUT'
         
         # Check for scrub motion - check all slots
         is_scrub = False
@@ -420,12 +659,7 @@ class TouchListener:
                 is_scrub = True
                 break
         
-        # Debug gesture classification
-        import datetime
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        print(f"[{timestamp}] 🔍 DEBUG: Gesture stats - fingers={finger_count}, max_move={int(max_move)}, tap_threshold={self.TAP_DISTANCE}, swipe_threshold={self.SWIPE_DISTANCE}, is_scrub={is_scrub}")
-        
-        # Simple classification
+        # Gesture classification priority: scrub > pinch > tap > swipe
         if is_scrub:
             self._handle_scrub_gesture(finger_count, positions)
         elif is_pinch:
@@ -816,12 +1050,27 @@ class TouchListener:
                 pass
     
     def _calculate_distance(self):
-        if len(self.active_slots) != 2:
+        finger_count = len(self.active_slots)
+        if finger_count < 2 or finger_count > self.PINCH_MAX_FINGERS:
             return 0.0
+        
         slots = list(self.active_slots)
-        x1, y1 = self.fingers[slots[0]][2], self.fingers[slots[0]][3]
-        x2, y2 = self.fingers[slots[1]][2], self.fingers[slots[1]][3]
-        return math.sqrt((x1 - x2)**2 + (y1 - y2)**2)
+        if finger_count == 2:
+            # 2-finger pinch: simple distance between two points
+            x1, y1 = self.fingers[slots[0]][2], self.fingers[slots[0]][3]
+            x2, y2 = self.fingers[slots[1]][2], self.fingers[slots[1]][3]
+            return math.sqrt((x1 - x2)**2 + (y1 - y2)**2)
+        elif finger_count == 3:
+            # 3-finger pinch: use average distance between all pairs
+            positions = [(self.fingers[slot][2], self.fingers[slot][3]) for slot in slots]
+            distances = []
+            for i in range(len(positions)):
+                for j in range(i + 1, len(positions)):
+                    x1, y1 = positions[i]
+                    x2, y2 = positions[j]
+                    distances.append(math.sqrt((x1 - x2)**2 + (y1 - y2)**2))
+            return sum(distances) / len(distances)  # Average distance
+        return 0.0
 
 def main():
     listener = TouchListener()
