@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#/usr/bin/env python3
 """
 Touchscreen Listener (tl.py)
 A relaxed touchscreen event listener that actually works.
@@ -55,6 +55,21 @@ class TouchListener:
             'notified': False,
             'start_positions': []
         }  # Track hold state per gesture (all fingers together)
+        
+        # Drag and hold detection
+        self.DRAG_HOLD_MIN_DRAG_DISTANCE_PERCENT = 5.0
+        self.DRAG_HOLD_STOP_MOVEMENT_PERCENT = 0.5
+        self.DRAG_HOLD_TIMEOUT = 500  # ms
+        self.gesture_drag_hold_state = {
+            'is_drag_hold': False,
+            'drag_start_time': 0,
+            'stop_start_time': 0,
+            'notified': False,
+            'initial_drag_detected': False,
+            'start_positions': [],
+            'drag_end_positions': []
+        }
+        self.motion_stop_tracking = {}
         
         # Real-time scrub detection (new approach)
         self.motion_history = {}  # Track motion history for each slot
@@ -117,6 +132,8 @@ class TouchListener:
         self.TAP_HOLD_MAX_MOVEMENT = int(screen_diagonal * self.TAP_HOLD_MAX_MOVEMENT_PERCENT / 100)
         self.SCRUB_MIN_SEGMENT_DISTANCE = int(self.screen_height * self.SCRUB_MIN_SEGMENT_PERCENT / 100)
         self.SCRUB_MIN_VERTICAL_TRAVEL = int(self.screen_height * self.SCRUB_MIN_VERTICAL_PERCENT / 100)
+        self.DRAG_HOLD_MIN_DRAG_DISTANCE = int(screen_diagonal * self.DRAG_HOLD_MIN_DRAG_DISTANCE_PERCENT / 100)
+        self.DRAG_HOLD_STOP_MOVEMENT = int(screen_diagonal * self.DRAG_HOLD_STOP_MOVEMENT_PERCENT / 100)
         
         # Remove old scrub variables (we're using motion-based approach now)
         self.scrub_swipes = []  # Keep for compatibility but will be removed
@@ -149,6 +166,8 @@ class TouchListener:
         print(f"📏 Swipe threshold: {self.SWIPE_DISTANCE}px ({self.SWIPE_DISTANCE_PERCENT}%)")
         print(f"📏 Double tap distance: {self.DOUBLE_TAP_MAX_DISTANCE}px ({self.DOUBLE_TAP_MAX_DISTANCE_PERCENT}%)")
         print(f"📏 Directional swipe min distance: {self.DIRECTIONAL_SWIPE_MIN_DISTANCE}px ({self.DIRECTIONAL_SWIPE_MIN_DISTANCE_PERCENT}%)")
+        print(f"📏 Drag hold min drag: {self.DRAG_HOLD_MIN_DRAG_DISTANCE}px ({self.DRAG_HOLD_MIN_DRAG_DISTANCE_PERCENT}%)")
+        print(f"📏 Drag hold stop movement: {self.DRAG_HOLD_STOP_MOVEMENT}px ({self.DRAG_HOLD_STOP_MOVEMENT_PERCENT}%)")
         print(f"🎯 Screen center: ({self.center_x}, {self.center_y})")
         print("🎯 Ready! Try taps, swipes, and directional swipes from corners/edges to center!")
         
@@ -191,6 +210,9 @@ class TouchListener:
                                         if slot in self.active_holds:
                                             del self.active_holds[slot]
                                         
+                                        if slot in self.motion_stop_tracking:
+                                            del self.motion_stop_tracking[slot]
+                                        
                                         if slot in self.active_slots:
                                             self.active_slots.remove(slot)
                                         
@@ -198,6 +220,8 @@ class TouchListener:
                                             print(f"🔍 DEBUG: All fingers lifted, active_slots empty, is_hold={self.gesture_hold_state['is_hold']}")
                                             if self.gesture_hold_state['is_hold']:
                                                 self._handle_hold_end()
+                                            elif self.gesture_drag_hold_state['is_drag_hold']:
+                                                self._handle_drag_hold_end()
                                             else:
                                                 self._process_gesture()
                                             self.fingers.clear()
@@ -208,6 +232,15 @@ class TouchListener:
                                                 'start_time': 0,
                                                 'notified': False,
                                                 'start_positions': []
+                                            }
+                                            self.gesture_drag_hold_state = {
+                                                'is_drag_hold': False,
+                                                'drag_start_time': 0,
+                                                'stop_start_time': 0,
+                                                'notified': False,
+                                                'initial_drag_detected': False,
+                                                'start_positions': [],
+                                                'drag_end_positions': []
                                             }
                                             self.pinch_data = {
                                                 'initial_distance': 0.0,
@@ -239,6 +272,12 @@ class TouchListener:
                                         'start_x': 0,
                                         'start_y': 0,
                                         'notified': False
+                                    }
+                                    # Initialize motion stop tracking
+                                    self.motion_stop_tracking[slot] = {
+                                        'last_x': 0,
+                                        'last_y': 0,
+                                        'last_move_time': time.time()
                                     }
                             elif ev.code == ecodes.ABS_MT_POSITION_X:
                                 slot = current_slot
@@ -289,8 +328,26 @@ class TouchListener:
                                                 del self.active_holds[slot]
                                                 print(f"🔍 DEBUG: Removed hold tracking for slot {slot} due to Y movement: {movement} > {self.TAP_HOLD_MAX_MOVEMENT}")
                     
-                    # After processing batch, check for hold
+                    # After processing batch, update motion stop tracking
                     current_time = time.time()
+                    for slot in list(self.active_slots):
+                        if slot in self.fingers and slot in self.motion_stop_tracking:
+                            ex, ey = self.fingers[slot][2], self.fingers[slot][3]
+                            last_x = self.motion_stop_tracking[slot]['last_x']
+                            last_y = self.motion_stop_tracking[slot]['last_y']
+                            if last_x == 0 and last_y == 0:
+                                # First update
+                                self.motion_stop_tracking[slot]['last_x'] = ex
+                                self.motion_stop_tracking[slot]['last_y'] = ey
+                                self.motion_stop_tracking[slot]['last_move_time'] = current_time
+                            else:
+                                move_dist = math.sqrt((ex - last_x)**2 + (ey - last_y)**2)
+                                if move_dist > self.DRAG_HOLD_STOP_MOVEMENT:
+                                    self.motion_stop_tracking[slot]['last_x'] = ex
+                                    self.motion_stop_tracking[slot]['last_y'] = ey
+                                    self.motion_stop_tracking[slot]['last_move_time'] = current_time
+                    
+                    # Check for hold
                     if self.gesture_hold_state['start_time'] > 0 and not self.gesture_hold_state['notified']:
                         hold_duration = current_time - self.gesture_hold_state['start_time']
                         hold_duration_ms = hold_duration * 1000
@@ -314,6 +371,40 @@ class TouchListener:
                             else:
                                 self.gesture_hold_state['is_hold'] = False
                                 print(f"🔍 DEBUG: Hold rejected due to movement, duration={hold_duration_ms:.0f}ms, stable={all_fingers_stable}")
+                    
+                    # Check for drag and hold
+                    if not self.gesture_hold_state['is_hold'] and not self.gesture_drag_hold_state['notified'] and self.active_slots:
+                        all_stable = True
+                        max_movement = 0
+                        has_initial_drag = self.gesture_drag_hold_state['initial_drag_detected']
+                        
+                        if not has_initial_drag:
+                            for slot in self.active_slots:
+                                if slot in self.fingers:
+                                    sx, sy, ex, ey, st = self.fingers[slot]
+                                    movement = math.sqrt((ex - sx)**2 + (ey - sy)**2)
+                                    max_movement = max(max_movement, movement)
+                            if max_movement > self.DRAG_HOLD_MIN_DRAG_DISTANCE:
+                                self.gesture_drag_hold_state['initial_drag_detected'] = True
+                                self.gesture_drag_hold_state['drag_start_time'] = min(st for _,_,_,_,st in self.fingers.values())
+                                self.gesture_drag_hold_state['start_positions'] = [(sx, sy) for sx,sy,_,_,_ in self.fingers.values()]
+                                has_initial_drag = True
+                        
+                        if has_initial_drag:
+                            stop_time = float('inf')
+                            for slot in self.active_slots:
+                                if slot in self.motion_stop_tracking:
+                                    time_since_move = current_time - self.motion_stop_tracking[slot]['last_move_time']
+                                    stop_time = min(stop_time, time_since_move)
+                                    if time_since_move < self.DRAG_HOLD_TIMEOUT / 1000.0:
+                                        all_stable = False
+                                        break
+                            if all_stable and stop_time >= self.DRAG_HOLD_TIMEOUT / 1000.0:
+                                self.gesture_drag_hold_state['is_drag_hold'] = True
+                                self.gesture_drag_hold_state['notified'] = True
+                                self.gesture_drag_hold_state['stop_start_time'] = current_time - stop_time
+                                self.gesture_drag_hold_state['drag_end_positions'] = [(ex, ey) for _,_,ex,ey,_ in self.fingers.values()]
+                                self._handle_drag_hold_start()
                     
                     # Track pinch distance in real-time
                     if len(self.active_slots) >= self.PINCH_MIN_FINGERS and len(self.active_slots) <= self.PINCH_MAX_FINGERS and not self.pinch_data['is_active']:
@@ -341,177 +432,6 @@ class TouchListener:
                     
                     # Clear batch
                     event_batch = []
-            for event in self.device.read_loop():
-                if not self.running:
-                    break
-                
-                event_batch.append(event)
-                
-                if event.type == ecodes.EV_SYN and event.code == ecodes.SYN_REPORT:
-                    # Process the batch of events
-                    for ev in event_batch:
-                        if ev.type == ecodes.EV_ABS:
-                            if ev.code == ecodes.ABS_MT_SLOT:
-                                current_slot = ev.value
-                            elif ev.code == ecodes.ABS_MT_TRACKING_ID:
-                                slot = current_slot
-                                if ev.value == -1:
-                                    # Finger lifted
-                                    if slot in self.fingers:
-                                        # Remove from slot-level hold tracking
-                                        if slot in self.active_holds:
-                                            del self.active_holds[slot]
-                                        
-                                        if slot in self.active_slots:
-                                            self.active_slots.remove(slot)
-                                        
-                                        if not self.active_slots:
-                                            print(f"🔍 DEBUG: All fingers lifted, active_slots empty, is_hold={self.gesture_hold_state['is_hold']}")
-                                            if self.gesture_hold_state['is_hold']:
-                                                self._handle_hold_end()
-                                            else:
-                                                self._process_gesture()
-                                            self.fingers.clear()
-                                            self.active_slots.clear()
-                                            # Reset gesture hold state
-                                            self.gesture_hold_state = {
-                                                'is_hold': False,
-                                                'start_time': 0,
-                                                'notified': False,
-                                                'start_positions': []
-                                            }
-                                            self.pinch_data = {
-                                                'initial_distance': 0.0,
-                                                'min_distance': float('inf'),
-                                                'max_distance': 0.0,
-                                                'is_active': False
-                                            }
-                                else:
-                                    # Finger placed
-                                    slot_data[slot] = {'x': 0, 'y': 0}  # Always reset for new touch
-                                    self.fingers[slot] = (0, 0, 0, 0, time.time())
-                                    self.active_slots.add(slot)
-                                    
-                                    # Initialize gesture hold state if this is the first finger
-                                    if len(self.active_slots) == 1:
-                                        self.gesture_hold_state = {
-                                            'is_hold': False,
-                                            'start_time': time.time(),
-                                            'notified': False,
-                                            'start_positions': []
-                                        }
-                                        # First finger touched, initializing hold state
-                                    else:
-                                        print(f"🔍 Additional finger touched, total fingers: {len(self.active_slots)}")
-                                    
-                                    # Start tracking for potential hold (per slot)
-                                    self.active_holds[slot] = {
-                                        'start_time': time.time(),
-                                        'start_x': 0,
-                                        'start_y': 0,
-                                        'notified': False
-                                    }
-                            elif ev.code == ecodes.ABS_MT_POSITION_X:
-                                slot = current_slot
-                                if slot in slot_data:
-                                    slot_data[slot]['x'] = ev.value
-                                    if slot in self.fingers:
-                                        sx, sy, _, _, st = self.fingers[slot]
-                                        if sx == 0:
-                                            current_y = slot_data[slot].get('y', 0)
-                                            self.fingers[slot] = (ev.value, current_y, ev.value, current_y, st)
-                                            print(f"🔍 DEBUG: Initial X for slot {slot}: start=({ev.value}, {current_y}), end= same")
-                                        else:
-                                            new_ex = ev.value
-                                            new_ey = slot_data[slot]['y']
-                                            self.fingers[slot] = (sx, sy, new_ex, new_ey, st)
-                                            self._track_motion(slot, new_ex, new_ey)
-                                            print(f"🔍 DEBUG: Updated X for slot {slot}: start=({sx}, {sy}), end=({new_ex}, {new_ey})")
-                                    if slot in self.active_holds:
-                                        if self.active_holds[slot]['start_x'] == 0:
-                                            self.active_holds[slot]['start_x'] = ev.value
-                                        else:
-                                            movement = abs(ev.value - self.active_holds[slot]['start_x'])
-                                            if movement > self.TAP_HOLD_MAX_MOVEMENT and not self.active_holds[slot]['notified']:
-                                                del self.active_holds[slot]
-                                                print(f"🔍 DEBUG: Removed hold tracking for slot {slot} due to X movement: {movement} > {self.TAP_HOLD_MAX_MOVEMENT}")
-                            elif ev.code == ecodes.ABS_MT_POSITION_Y:
-                                slot = current_slot
-                                if slot in slot_data:
-                                    slot_data[slot]['y'] = ev.value
-                                    if slot in self.fingers:
-                                        sx, sy, _, _, st = self.fingers[slot]
-                                        if sy == 0:
-                                            current_x = slot_data[slot].get('x', 0)
-                                            self.fingers[slot] = (current_x, ev.value, current_x, ev.value, st)
-                                            print(f"🔍 DEBUG: Initial Y for slot {slot}: start=({current_x}, {ev.value}), end= same")
-                                        else:
-                                            new_ex = slot_data[slot]['x']
-                                            new_ey = ev.value
-                                            self.fingers[slot] = (sx, sy, new_ex, new_ey, st)
-                                            self._track_motion(slot, new_ex, new_ey)
-                                            print(f"🔍 DEBUG: Updated Y for slot {slot}: start=({sx}, {sy}), end=({new_ex}, {new_ey})")
-                                    if slot in self.active_holds:
-                                        if self.active_holds[slot]['start_y'] == 0:
-                                            self.active_holds[slot]['start_y'] = ev.value
-                                        else:
-                                            movement = abs(ev.value - self.active_holds[slot]['start_y'])
-                                            if movement > self.TAP_HOLD_MAX_MOVEMENT and not self.active_holds[slot]['notified']:
-                                                del self.active_holds[slot]
-                                                print(f"🔍 DEBUG: Removed hold tracking for slot {slot} due to Y movement: {movement} > {self.TAP_HOLD_MAX_MOVEMENT}")
-                    
-                    # After processing batch, check for hold
-                    current_time = time.time()
-                    if self.gesture_hold_state['start_time'] > 0 and not self.gesture_hold_state['notified']:
-                        hold_duration = current_time - self.gesture_hold_state['start_time']
-                        hold_duration_ms = hold_duration * 1000
-                        
-                        effective_hold_timeout = self.TAP_HOLD_TIMEOUT if len(self.active_slots) < 2 or len(self.active_slots) > self.PINCH_MAX_FINGERS else self.TAP_HOLD_TIMEOUT * 0.8  # 20% shorter for 2 fingers to avoid slow pinch conflicts
-                        if hold_duration_ms >= effective_hold_timeout:
-                            all_fingers_stable = True
-                            for slot in list(self.active_slots):
-                                if slot in self.fingers:
-                                    sx, sy, ex, ey, st = self.fingers[slot]
-                                    movement = math.sqrt((ex - sx)**2 + (ey - sy)**2)
-                                    if movement > self.TAP_HOLD_MAX_MOVEMENT:
-                                        all_fingers_stable = False
-                                        break
-                            
-                            if all_fingers_stable:
-                                self.gesture_hold_state['is_hold'] = True
-                                self.gesture_hold_state['notified'] = True
-                                self._handle_hold_start()
-                                print(f"🔍 DEBUG: Hold confirmed, duration={hold_duration_ms:.0f}ms, stable={all_fingers_stable}")
-                            else:
-                                self.gesture_hold_state['is_hold'] = False
-                                print(f"🔍 DEBUG: Hold rejected due to movement, duration={hold_duration_ms:.0f}ms, stable={all_fingers_stable}")
-                    
-                    # Track pinch distance in real-time
-                    if len(self.active_slots) >= self.PINCH_MIN_FINGERS and len(self.active_slots) <= self.PINCH_MAX_FINGERS and not self.pinch_data['is_active']:
-                        current_distance = self._calculate_distance()
-                        if current_distance > 0:
-                            slots = list(self.active_slots)
-                            self.pinch_data['initial_distance'] = current_distance
-                            self.pinch_data['min_distance'] = current_distance
-                            self.pinch_data['max_distance'] = current_distance
-                            self.pinch_data['is_active'] = True
-                            finger_desc = "fingers" if len(slots) > 2 else "finger"
-                            print(f"🔍 DEBUG: Pinch tracking started - {len(slots)} {finger_desc}, initial_distance={current_distance:.1f}")
-                    elif (len(self.active_slots) < self.PINCH_MIN_FINGERS or len(self.active_slots) > self.PINCH_MAX_FINGERS) and self.pinch_data['is_active']:
-                        self.pinch_data['is_active'] = False
-                        print("🔍 DEBUG: Pinch tracking stopped due to finger count change")
-                    if len(self.active_slots) >= self.PINCH_MIN_FINGERS and len(self.active_slots) <= self.PINCH_MAX_FINGERS and self.pinch_data['is_active']:
-                        current_distance = self._calculate_distance()
-                        if current_distance > 0:
-                            old_min = self.pinch_data['min_distance']
-                            old_max = self.pinch_data['max_distance']
-                            self.pinch_data['min_distance'] = min(old_min, current_distance)
-                            self.pinch_data['max_distance'] = max(old_max, current_distance)
-                            if self.pinch_data['min_distance'] != old_min or self.pinch_data['max_distance'] != old_max:
-                                print(f"🔍 DEBUG: Distance updated - current={current_distance:.1f}, min={self.pinch_data['min_distance']:.1f}, max={self.pinch_data['max_distance']:.1f}")
-                    
-                    # Clear batch
-                    event_batch = []        
         except KeyboardInterrupt:
             pass
         except Exception as e:
@@ -812,7 +732,6 @@ class TouchListener:
         print(f"[{timestamp}] 👋 SWIPE: {finger_count} finger(s) {direction} [{int(distance)}px]")
     
     
-    
     def _handle_hold_start(self):
         """Handle tap and hold start (confirmation)."""
         import datetime
@@ -867,6 +786,61 @@ class TouchListener:
         if self.debug_file:
             try:
                 debug_msg = f"[{timestamp}] ✋ TOUCH AND HOLD END: {finger_count} fingers, duration: {hold_duration:.1f}s\n\n"
+                self.debug_file.write(debug_msg)
+                self.debug_file.flush()
+            except:
+                pass
+    
+    def _handle_drag_hold_start(self):
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        finger_count = len(self.fingers)
+        positions = self.gesture_drag_hold_state['drag_end_positions']
+        start_time = self.gesture_drag_hold_state['drag_start_time']
+        confirmation_time = time.time()
+        time_to_confirm = (confirmation_time - start_time) * 1000
+        
+        print(f"[{timestamp}] 🖐️ DRAG AND HOLD CONFIRMED: {finger_count} finger(s)")
+        print(f"   Time to confirm hold after drag: {time_to_confirm - self.DRAG_HOLD_TIMEOUT:.0f}ms drag + {self.DRAG_HOLD_TIMEOUT}ms hold")
+        
+        for i, (x, y) in enumerate(positions):
+            print(f"   Finger {i+1} hold position: ({int(x)}, {int(y)})")
+        
+        # Calculate drag distance for each finger
+        for i, (sx, sy) in enumerate(self.gesture_drag_hold_state['start_positions']):
+            ex, ey = positions[i]
+            dist = math.sqrt((ex - sx)**2 + (ey - sy)**2)
+            print(f"   Finger {i+1} drag distance: {int(dist)}px")
+        
+        if self.debug_file:
+            try:
+                debug_msg = f"[{timestamp}] 🖐️ DRAG AND HOLD CONFIRMED: {finger_count} fingers\n"
+                self.debug_file.write(debug_msg)
+                self.debug_file.flush()
+            except:
+                pass
+    
+    def _handle_drag_hold_end(self):
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        finger_count = len(self.fingers)
+        positions = [(ex, ey) for _,_,ex,ey,_ in self.fingers.values()]
+        drag_start_time = self.gesture_drag_hold_state['drag_start_time']
+        stop_start_time = self.gesture_drag_hold_state['stop_start_time']
+        end_time = time.time()
+        total_duration = end_time - drag_start_time
+        hold_duration = end_time - stop_start_time
+        
+        print(f"[{timestamp}] ✊ DRAG AND HOLD END: {finger_count} finger(s)")
+        print(f"   Total duration: {total_duration:.1f}s (drag + hold)")
+        print(f"   Hold duration: {hold_duration:.1f}s")
+        
+        for i, (x, y) in enumerate(positions):
+            print(f"   Finger {i+1} end position: ({int(x)}, {int(y)})")
+        
+        if self.debug_file:
+            try:
+                debug_msg = f"[{timestamp}] ✊ DRAG AND HOLD END: {finger_count} fingers, total {total_duration:.1f}s\n\n"
                 self.debug_file.write(debug_msg)
                 self.debug_file.flush()
             except:
