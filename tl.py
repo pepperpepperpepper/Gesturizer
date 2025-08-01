@@ -15,6 +15,7 @@ class TouchListener:
         self.device = None
         self.running = False
         self.fingers = {}
+        self.active_slots = set()
         self.last_tap = None
         self.last_tap_time = 0
         self.last_tap_fingers = 0
@@ -44,8 +45,8 @@ class TouchListener:
         }
         
         # Tap and hold detection
-        self.TAP_HOLD_TIMEOUT = 1000  # 1000ms (1 second) before recognizing as hold
-        self.TAP_HOLD_MAX_MOVEMENT_PERCENT = 1.5  # Reduced to 1.5% for better swipe/hold distinction
+        self.TAP_HOLD_TIMEOUT = 500  # 500ms (0.5 seconds) before recognizing as hold
+        self.TAP_HOLD_MAX_MOVEMENT_PERCENT = 0.5  # Reduced to 0.5% for stricter hold detection and better scrub distinction
         self.TAP_HOLD_MIN_DURATION = 500  # Minimum 500ms before considering as hold (prevent false positives)
         self.active_holds = {}  # Track active holds by slot
         self.gesture_hold_state = {
@@ -57,8 +58,9 @@ class TouchListener:
         
         # Real-time scrub detection (new approach)
         self.motion_history = {}  # Track motion history for each slot
-        self.SCRUB_MIN_DIRECTION_CHANGES = 2  # Minimum direction changes for scrub
-        self.SCRUB_MIN_TOTAL_DISTANCE_PERCENT = 20.0  # Minimum total distance for scrub
+        self.SCRUB_MIN_SEGMENTS = 4  # Minimum vertical segments for scrub
+        self.SCRUB_MIN_SEGMENT_PERCENT = 3.0  # Percent of screen height for each segment
+        self.SCRUB_MIN_VERTICAL_PERCENT = 20.0  # Percent of screen height for total vertical travel
         
         # Debug logging
         try:
@@ -102,7 +104,8 @@ class TouchListener:
         self.DOUBLE_TAP_MAX_DISTANCE = int(screen_diagonal * self.DOUBLE_TAP_MAX_DISTANCE_PERCENT / 100)
         self.DIRECTIONAL_SWIPE_MIN_DISTANCE = int(screen_diagonal * self.DIRECTIONAL_SWIPE_MIN_DISTANCE_PERCENT / 100)
         self.TAP_HOLD_MAX_MOVEMENT = int(screen_diagonal * self.TAP_HOLD_MAX_MOVEMENT_PERCENT / 100)
-        self.SCRUB_MIN_TOTAL_DISTANCE = int(screen_diagonal * self.SCRUB_MIN_TOTAL_DISTANCE_PERCENT / 100)
+        self.SCRUB_MIN_SEGMENT_DISTANCE = int(self.screen_height * self.SCRUB_MIN_SEGMENT_PERCENT / 100)
+        self.SCRUB_MIN_VERTICAL_TRAVEL = int(self.screen_height * self.SCRUB_MIN_VERTICAL_PERCENT / 100)
         
         # Remove old scrub variables (we're using motion-based approach now)
         self.scrub_swipes = []  # Keep for compatibility but will be removed
@@ -155,151 +158,154 @@ class TouchListener:
             current_slot = 0
             slot_data = {}
             
+            event_batch = []
             for event in self.device.read_loop():
                 if not self.running:
                     break
-                    
-                if event.type == ecodes.EV_ABS:
-                    if event.code == ecodes.ABS_MT_SLOT:
-                        current_slot = event.value
-                    elif event.code == ecodes.ABS_MT_TRACKING_ID:
-                        slot = current_slot
-                        if event.value == -1:
-                            # Finger lifted
-                            if slot in self.fingers:
-                                # Remove from slot-level hold tracking
-                                if slot in self.active_holds:
-                                    del self.active_holds[slot]
-                                
-# Store all finger data before removing this finger
-                                all_fingers_data = dict(self.fingers)  # Copy all finger data
-                                finger_count_before_release = len(self.fingers)
-                                
-                                # Remove the finger from tracking
-                                del self.fingers[slot]
-                                
-                                # Check if this was the last finger in the gesture
-                                if len(self.fingers) == 0:  # This was the last finger being lifted
-                                    if self.gesture_hold_state['is_hold']:
-                                        # This was a hold gesture
-                                        self._handle_hold_end()
-                                    else:
-                                        # This was a normal gesture - restore all fingers for processing
-                                        self.fingers = all_fingers_data  # Restore all finger data
-                                        self._process_gesture(slot)
-                                        # Clear all fingers after processing
-                                        self.fingers.clear()
+                
+                event_batch.append(event)
+                
+                if event.type == ecodes.EV_SYN and event.code == ecodes.SYN_REPORT:
+                    # Process the batch of events
+                    for ev in event_batch:
+                        if ev.type == ecodes.EV_ABS:
+                            if ev.code == ecodes.ABS_MT_SLOT:
+                                current_slot = ev.value
+                            elif ev.code == ecodes.ABS_MT_TRACKING_ID:
+                                slot = current_slot
+                                if ev.value == -1:
+                                    # Finger lifted
+                                    if slot in self.fingers:
+                                        # Remove from slot-level hold tracking
+                                        if slot in self.active_holds:
+                                            del self.active_holds[slot]
+                                        
+                                        if slot in self.active_slots:
+                                            self.active_slots.remove(slot)
+                                        
+                                        if not self.active_slots:
+                                            print(f"🔍 DEBUG: All fingers lifted, active_slots empty, is_hold={self.gesture_hold_state['is_hold']}")
+                                            if self.gesture_hold_state['is_hold']:
+                                                self._handle_hold_end()
+                                            else:
+                                                self._process_gesture()
+                                            self.fingers.clear()
+                                            self.active_slots.clear()
+                                            # Reset gesture hold state
+                                            self.gesture_hold_state = {
+                                                'is_hold': False,
+                                                'start_time': 0,
+                                                'notified': False,
+                                                'start_positions': []
+                                            }
+                                else:
+                                    # Finger placed
+                                    slot_data[slot] = {'x': 0, 'y': 0}  # Always reset for new touch
+                                    self.fingers[slot] = (0, 0, 0, 0, time.time())
+                                    self.active_slots.add(slot)
                                     
-                                    # Reset gesture hold state
-                                    self.gesture_hold_state = {
-                                        'is_hold': False,
-                                        'start_time': 0,
-                                        'notified': False,
-                                        'start_positions': []
+                                    # Initialize gesture hold state if this is the first finger
+                                    if len(self.active_slots) == 1:
+                                        self.gesture_hold_state = {
+                                            'is_hold': False,
+                                            'start_time': time.time(),
+                                            'notified': False,
+                                            'start_positions': []
+                                        }
+                                        # First finger touched, initializing hold state
+                                    else:
+                                        print(f"🔍 Additional finger touched, total fingers: {len(self.active_slots)}")
+                                    
+                                    # Start tracking for potential hold (per slot)
+                                    self.active_holds[slot] = {
+                                        'start_time': time.time(),
+                                        'start_x': 0,
+                                        'start_y': 0,
+                                        'notified': False
                                     }
-                        else:
-                            # Finger placed
-                            if slot not in slot_data:
-                                slot_data[slot] = {'x': 0, 'y': 0}
-                            self.fingers[slot] = (0, 0, 0, 0, time.time())
-                            
-                            # Initialize gesture hold state if this is the first finger
-                            if len(self.fingers) == 1:
-                                self.gesture_hold_state = {
-                                    'is_hold': False,
-                                    'start_time': time.time(),
-                                    'notified': False,
-                                    'start_positions': []
-                                }
-                                # First finger touched, initializing hold state
-                            else:
-                                print(f"🔍 Additional finger touched, total fingers: {len(self.fingers)}")
-                            
-                            # Start tracking for potential hold (per slot)
-                            self.active_holds[slot] = {
-                                'start_time': time.time(),
-                                'start_x': 0,
-                                'start_y': 0,
-                                'notified': False
-                            }                
-                elif event.code == ecodes.ABS_MT_POSITION_X:
-                    slot = current_slot
-                    if slot in slot_data:
-                        slot_data[slot]['x'] = event.value
-                        if slot in self.fingers:
-                            sx, sy, _, old_y, st = self.fingers[slot]
-                            if sx == 0:
-                                self.fingers[slot] = (event.value, old_y, event.value, old_y, st)
-                            else:
-                                self.fingers[slot] = (sx, sy, event.value, old_y, st)
-                                # Track motion for scrub detection
-                                self._track_motion(slot, event.value, slot_data[slot]['y'])
-                        # Update hold tracking
-                        if slot in self.active_holds:
-                            if self.active_holds[slot]['start_x'] == 0:
-                                self.active_holds[slot]['start_x'] = event.value
-                            else:
-                                # Check if movement is too much for a hold
-                                movement = abs(event.value - self.active_holds[slot]['start_x'])
-                                if movement > self.TAP_HOLD_MAX_MOVEMENT and not self.active_holds[slot]['notified']:
-                                    # Too much movement, remove from hold tracking
-                                    del self.active_holds[slot]
-                
-                elif event.code == ecodes.ABS_MT_POSITION_Y:
-                    slot = current_slot
-                    if slot in slot_data:
-                        slot_data[slot]['y'] = event.value
-                        if slot in self.fingers:
-                            sx, sy, old_x, _, st = self.fingers[slot]
-                            if sy == 0:
-                                self.fingers[slot] = (old_x, event.value, old_x, event.value, st)
-                            else:
-                                self.fingers[slot] = (sx, sy, old_x, event.value, st)
-                                # Track motion for scrub detection
-                                self._track_motion(slot, slot_data[slot]['x'], event.value)
-                        # Update hold tracking
-                        if slot in self.active_holds:
-                            if self.active_holds[slot]['start_y'] == 0:
-                                self.active_holds[slot]['start_y'] = event.value
-                            else:
-                                # Check if movement is too much for a hold
-                                movement = abs(event.value - self.active_holds[slot]['start_y'])
-                                if movement > self.TAP_HOLD_MAX_MOVEMENT and not self.active_holds[slot]['notified']:
-                                    # Too much movement, remove from hold tracking
-                                    del self.active_holds[slot]
-                
-                # Check for tap and hold (check periodically)
-                current_time = time.time()
-                if self.gesture_hold_state['start_time'] > 0 and not self.gesture_hold_state['notified']:
-                    hold_duration = current_time - self.gesture_hold_state['start_time']
-                    hold_duration_ms = hold_duration * 1000
+                            elif ev.code == ecodes.ABS_MT_POSITION_X:
+                                slot = current_slot
+                                if slot in slot_data:
+                                    slot_data[slot]['x'] = ev.value
+                                    if slot in self.fingers:
+                                        sx, sy, _, _, st = self.fingers[slot]
+                                        if sx == 0:
+                                            current_y = slot_data[slot].get('y', 0)
+                                            self.fingers[slot] = (ev.value, current_y, ev.value, current_y, st)
+                                            print(f"🔍 DEBUG: Initial X for slot {slot}: start=({ev.value}, {current_y}), end= same")
+                                        else:
+                                            new_ex = ev.value
+                                            new_ey = slot_data[slot]['y']
+                                            self.fingers[slot] = (sx, sy, new_ex, new_ey, st)
+                                            self._track_motion(slot, new_ex, new_ey)
+                                            print(f"🔍 DEBUG: Updated X for slot {slot}: start=({sx}, {sy}), end=({new_ex}, {new_ey})")
+                                    if slot in self.active_holds:
+                                        if self.active_holds[slot]['start_x'] == 0:
+                                            self.active_holds[slot]['start_x'] = ev.value
+                                        else:
+                                            movement = abs(ev.value - self.active_holds[slot]['start_x'])
+                                            if movement > self.TAP_HOLD_MAX_MOVEMENT and not self.active_holds[slot]['notified']:
+                                                del self.active_holds[slot]
+                                                print(f"🔍 DEBUG: Removed hold tracking for slot {slot} due to X movement: {movement} > {self.TAP_HOLD_MAX_MOVEMENT}")
+                            elif ev.code == ecodes.ABS_MT_POSITION_Y:
+                                slot = current_slot
+                                if slot in slot_data:
+                                    slot_data[slot]['y'] = ev.value
+                                    if slot in self.fingers:
+                                        sx, sy, _, _, st = self.fingers[slot]
+                                        if sy == 0:
+                                            current_x = slot_data[slot].get('x', 0)
+                                            self.fingers[slot] = (current_x, ev.value, current_x, ev.value, st)
+                                            print(f"🔍 DEBUG: Initial Y for slot {slot}: start=({current_x}, {ev.value}), end= same")
+                                        else:
+                                            new_ex = slot_data[slot]['x']
+                                            new_ey = ev.value
+                                            self.fingers[slot] = (sx, sy, new_ex, new_ey, st)
+                                            self._track_motion(slot, new_ex, new_ey)
+                                            print(f"🔍 DEBUG: Updated Y for slot {slot}: start=({sx}, {sy}), end=({new_ex}, {new_ey})")
+                                    if slot in self.active_holds:
+                                        if self.active_holds[slot]['start_y'] == 0:
+                                            self.active_holds[slot]['start_y'] = ev.value
+                                        else:
+                                            movement = abs(ev.value - self.active_holds[slot]['start_y'])
+                                            if movement > self.TAP_HOLD_MAX_MOVEMENT and not self.active_holds[slot]['notified']:
+                                                del self.active_holds[slot]
+                                                print(f"🔍 DEBUG: Removed hold tracking for slot {slot} due to Y movement: {movement} > {self.TAP_HOLD_MAX_MOVEMENT}")
                     
-                    if hold_duration_ms >= self.TAP_HOLD_TIMEOUT:  # Use milliseconds directly
-                        # Check if no fingers have moved too much
-                        all_fingers_stable = True
-                        for slot in self.fingers:
-                            if slot in self.fingers:
-                                sx, sy, ex, ey, st = self.fingers[slot]
-                                movement = math.sqrt((ex - sx)**2 + (ey - sy)**2)
-                                if movement > self.TAP_HOLD_MAX_MOVEMENT:
-                                    all_fingers_stable = False
-                                    break
+                    # After processing batch, check for hold
+                    current_time = time.time()
+                    if self.gesture_hold_state['start_time'] > 0 and not self.gesture_hold_state['notified']:
+                        hold_duration = current_time - self.gesture_hold_state['start_time']
+                        hold_duration_ms = hold_duration * 1000
                         
-                        if all_fingers_stable:
-                            # This is a hold gesture
-                            self.gesture_hold_state['is_hold'] = True
-                            self.gesture_hold_state['notified'] = True
-                            self._handle_hold_start()
-                        else:
-                            # If moved too much, this is not a hold
-                            self.gesture_hold_state['is_hold'] = False
+                        if hold_duration_ms >= self.TAP_HOLD_TIMEOUT:
+                            all_fingers_stable = True
+                            for slot in list(self.active_slots):
+                                if slot in self.fingers:
+                                    sx, sy, ex, ey, st = self.fingers[slot]
+                                    movement = math.sqrt((ex - sx)**2 + (ey - sy)**2)
+                                    if movement > self.TAP_HOLD_MAX_MOVEMENT:
+                                        all_fingers_stable = False
+                                        break
+                            
+                            if all_fingers_stable:
+                                self.gesture_hold_state['is_hold'] = True
+                                self.gesture_hold_state['notified'] = True
+                                self._handle_hold_start()
+                                print(f"🔍 DEBUG: Hold confirmed, duration={hold_duration_ms:.0f}ms, stable={all_fingers_stable}")
+                            else:
+                                self.gesture_hold_state['is_hold'] = False
+                                print(f"🔍 DEBUG: Hold rejected due to movement, duration={hold_duration_ms:.0f}ms, stable={all_fingers_stable}")
+                    
+                    # Clear batch
+                    event_batch = []
         
         except KeyboardInterrupt:
             pass
         except Exception as e:
             print(f"❌ Error: {e}")
     
-    def _process_gesture(self, lifted_slot):
+    def _process_gesture(self):
         if not self.fingers:
             return
         
@@ -312,21 +318,30 @@ class TouchListener:
             move = math.sqrt((ex-sx)**2 + (ey-sy)**2)
             max_move = max(max_move, move)
         
-        # Check for scrub motion within this touch
-        is_scrub = self._check_scrub_motion(lifted_slot)
+        # Check for scrub motion - check all slots
+        is_scrub = False
+        for slot in self.fingers.keys():
+            if self._check_scrub_motion(slot):
+                is_scrub = True
+                break
+        
+        # Debug gesture classification
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        print(f"[{timestamp}] 🔍 DEBUG: Gesture stats - fingers={finger_count}, max_move={int(max_move)}, tap_threshold={self.TAP_DISTANCE}, swipe_threshold={self.SWIPE_DISTANCE}, is_scrub={is_scrub}")
         
         # Simple classification
-        if max_move < self.TAP_DISTANCE:
-            self._handle_tap(finger_count, positions)
-        elif is_scrub:
+        if is_scrub:
             self._handle_scrub_gesture(finger_count, positions)
+        elif max_move < self.TAP_DISTANCE:
+            self._handle_tap(finger_count, positions)
         else:
             self._handle_swipe(finger_count, positions)
         
-        # Cleanup motion history for this slot
-        if lifted_slot in self.motion_history:
-            del self.motion_history[lifted_slot]
-        self.fingers.clear()
+        # Cleanup motion history for all slots
+        for slot in list(self.motion_history.keys()):
+            if slot in self.motion_history:
+                del self.motion_history[slot]
     
     def _handle_tap(self, finger_count, positions):
         """Handle tap with double and triple tap detection."""
@@ -507,7 +522,7 @@ class TouchListener:
         # Store start positions for end event
         self.gesture_hold_state['start_positions'] = positions
         
-        print(f"[{timestamp}] 🤚 TAP AND HOLD CONFIRMED: {finger_count} finger(s)")
+        print(f"[{timestamp}] 🤚 TOUCH AND HOLD CONFIRMED: {finger_count} finger(s)")
         print(f"   Time to confirm: {time_to_confirm:.0f}ms")
         
         for i, (fx, fy) in enumerate(positions):
@@ -515,7 +530,7 @@ class TouchListener:
         
         if self.debug_file:
             try:
-                debug_msg = f"[{timestamp}] 🤚 TAP AND HOLD CONFIRMED: {finger_count} fingers\n"
+                debug_msg = f"[{timestamp}] 🤚 TOUCH AND HOLD CONFIRMED: {finger_count} fingers\n"
                 self.debug_file.write(debug_msg)
                 self.debug_file.flush()
             except:
@@ -536,7 +551,7 @@ class TouchListener:
         # Format start time for display
         start_timestamp = datetime.datetime.fromtimestamp(hold_start_time).strftime("%H:%M:%S.%f")[:-3]
         
-        print(f"[{timestamp}] ✋ TAP AND HOLD END: {finger_count} finger(s)")
+        print(f"[{timestamp}] ✋ TOUCH AND HOLD END: {finger_count} finger(s)")
         print(f"   Started at: {start_timestamp}")
         print(f"   Total duration: {hold_duration:.1f}s")
         
@@ -545,7 +560,7 @@ class TouchListener:
         
         if self.debug_file:
             try:
-                debug_msg = f"[{timestamp}] ✋ TAP AND HOLD END: {finger_count} fingers, duration: {hold_duration:.1f}s\n\n"
+                debug_msg = f"[{timestamp}] ✋ TOUCH AND HOLD END: {finger_count} fingers, duration: {hold_duration:.1f}s\n\n"
                 self.debug_file.write(debug_msg)
                 self.debug_file.flush()
             except:
@@ -555,53 +570,31 @@ class TouchListener:
         """Track finger motion for scrub detection."""
         if slot not in self.motion_history:
             self.motion_history[slot] = {
-                'positions': [],
-                'directions': [],
-                'total_distance': 0
+                'vertical_segments': [],
+                'segment_dy': 0,
+                'total_vertical_travel': 0,
+                'total_horizontal_travel': 0,
+                'last_x': x,
+                'last_y': y
             }
         
         history = self.motion_history[slot]
         
         # Add new position
-        history['positions'].append((x, y))
-        
-        # Keep only recent positions (last 20)
-        if len(history['positions']) > 20:
-            history['positions'] = history['positions'][-20:]
-        
-        # Calculate direction changes if we have enough positions
-        if len(history['positions']) >= 3:
-            # Get last 3 positions to detect direction
-            p1, p2, p3 = history['positions'][-3:]
-            
-            # Calculate vectors
-            v1 = (p2[0] - p1[0], p2[1] - p1[1])
-            v2 = (p3[0] - p2[0], p3[1] - p2[1])
-            
-            # Calculate directions
-            dir1 = math.degrees(math.atan2(-v1[1], v1[0]))
-            dir2 = math.degrees(math.atan2(-v2[1], v2[0]))
-            
-            if dir1 < 0: dir1 += 360
-            if dir2 < 0: dir2 += 360
-            
-            # Check for direction change (more than 90 degrees)
-            angle_diff = abs(dir1 - dir2)
-            if angle_diff > 180:
-                angle_diff = 360 - angle_diff
-            
-            if angle_diff > 90:
-                history['directions'].append((dir1, dir2))
-                
-                # Keep only recent direction changes
-                if len(history['directions']) > 10:
-                    history['directions'] = history['directions'][-10:]
-        
-        # Calculate total distance traveled
-        if len(history['positions']) >= 2:
-            last_pos = history['positions'][-2]
-            distance = math.sqrt((x - last_pos[0])**2 + (y - last_pos[1])**2)
-            history['total_distance'] += distance
+        dx = x - history['last_x']
+        dy = y - history['last_y']
+        history['total_vertical_travel'] += abs(dy)
+        history['total_horizontal_travel'] += abs(dx)
+        history['segment_dy'] += dy
+        current_sign = 1 if history['segment_dy'] > 0 else -1 if history['segment_dy'] < 0 else 0
+        new_sign = 1 if dy > 0 else -1 if dy < 0 else 0
+        if new_sign != 0 and current_sign != 0 and new_sign != current_sign:
+            if abs(history['segment_dy']) >= self.SCRUB_MIN_SEGMENT_DISTANCE:
+                dir = 'down' if history['segment_dy'] > 0 else 'up'
+                history['vertical_segments'].append(dir)
+                history['segment_dy'] = dy
+        history['last_x'] = x
+        history['last_y'] = y
     
     def _check_scrub_motion(self, slot):
         """Check if the motion history indicates a scrub gesture."""
@@ -610,9 +603,13 @@ class TouchListener:
         
         history = self.motion_history[slot]
         
-        # Check minimum requirements
-        if (len(history['directions']) >= self.SCRUB_MIN_DIRECTION_CHANGES and
-            history['total_distance'] >= self.SCRUB_MIN_TOTAL_DISTANCE):
+        num_segments = len(history['vertical_segments'])
+        if abs(history['segment_dy']) >= self.SCRUB_MIN_SEGMENT_DISTANCE:
+            num_segments += 1
+        
+        if (num_segments >= self.SCRUB_MIN_SEGMENTS and
+            history['total_vertical_travel'] >= self.SCRUB_MIN_VERTICAL_TRAVEL and
+            history['total_vertical_travel'] > history['total_horizontal_travel'] * 1.5):
             return True
         
         return False
@@ -627,15 +624,15 @@ class TouchListener:
         history = self.motion_history[slot]
         
         print(f"[{timestamp}] 🔄 SCRUB GESTURE: {finger_count} finger(s)")
-        print(f"   Direction changes: {len(history['directions'])}")
-        print(f"   Total distance: {int(history['total_distance'])}px")
+        print(f"   Vertical segments: {len(history['vertical_segments'])}")
+        print(f"   Total vertical travel: {int(history['total_vertical_travel'])}px")
         
         for i, (x, y) in enumerate(positions):
             print(f"   Finger {i+1}: ({int(x)}, {int(y)})")
         
         if self.debug_file:
             try:
-                debug_msg = f"[{timestamp}] 🔄 SCRUB GESTURE: {finger_count} fingers, changes: {len(history['directions'])}, distance: {int(history['total_distance'])}px\n\n"
+                debug_msg = f"[{timestamp}] 🔄 SCRUB GESTURE: {finger_count} fingers, segments: {len(history['vertical_segments'])}, vertical travel: {int(history['total_vertical_travel'])}px\n\n"
                 self.debug_file.write(debug_msg)
                 self.debug_file.flush()
             except:
