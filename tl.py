@@ -63,7 +63,7 @@ class TouchListener:
         self.SCRUB_MIN_VERTICAL_PERCENT = 20.0  # Percent of screen height for total vertical travel
         # Pinch detection parameters
         self.PINCH_MIN_FINGERS = 2
-        self.PINCH_MAX_FINGERS = 3  # Support up to 3 fingers
+        self.PINCH_MAX_FINGERS = 5  # Support up to 5 fingers
         self.PINCH_MIN_CHANGE_PERCENT = 20.0  # Minimum percentage change in distance for pinch
         self.PINCH_DIRECTION_ANGLE_TOLERANCE = 45  # Degrees; tolerance for opposing directions (e.g., 180° ±45° for pinch)
         self.pinch_data = {
@@ -486,7 +486,8 @@ class TouchListener:
                                 self.gesture_hold_state['is_hold'] = False
                                 print(f"🔍 DEBUG: Hold rejected due to movement, duration={hold_duration_ms:.0f}ms, stable={all_fingers_stable}")
                     
-                    if len(self.active_slots) == self.PINCH_MIN_FINGERS and not self.pinch_data['is_active']:
+                    # Track pinch distance in real-time
+                    if len(self.active_slots) >= self.PINCH_MIN_FINGERS and len(self.active_slots) <= self.PINCH_MAX_FINGERS and not self.pinch_data['is_active']:
                         current_distance = self._calculate_distance()
                         if current_distance > 0:
                             slots = list(self.active_slots)
@@ -494,33 +495,12 @@ class TouchListener:
                             self.pinch_data['min_distance'] = current_distance
                             self.pinch_data['max_distance'] = current_distance
                             self.pinch_data['is_active'] = True
-                            print(f"🔍 DEBUG: Pinch tracking started - slots={slots}, pos1=({self.fingers[slots[0]][2]}, {self.fingers[slots[0]][3]}), pos2=({self.fingers[slots[1]][2]}, {self.fingers[slots[1]][3]}), initial_distance={current_distance:.1f}")
-                    if len(self.active_slots) == self.PINCH_MIN_FINGERS and not self.pinch_data['is_active']:
-                        current_distance = self._calculate_distance()
-                        if current_distance > 0:
-                            slots = list(self.active_slots)
-                            self.pinch_data['initial_distance'] = current_distance
-                            self.pinch_data['min_distance'] = current_distance
-                            self.pinch_data['max_distance'] = current_distance
-                            self.pinch_data['is_active'] = True
-                            print(f"🔍 DEBUG: Pinch tracking started - slots={slots}, pos1=({self.fingers[slots[0]][2]}, {self.fingers[slots[0]][3]}), pos2=({self.fingers[slots[1]][2]}, {self.fingers[slots[1]][3]}), initial_distance={current_distance:.1f}")
-                    # Track pinch distance in real-time
-                    # Track pinch distance in real-time
-                    if len(self.active_slots) >= self.PINCH_MIN_FINGERS and len(self.active_slots) <= self.PINCH_MAX_FINGERS and self.pinch_data['is_active']:
-                        current_distance = self._calculate_distance()
-                        if current_distance > 0:
-                            old_min = self.pinch_data['min_distance']
-                            old_max = self.pinch_data['max_distance']
-                            self.pinch_data['min_distance'] = min(old_min, current_distance)
-                            self.pinch_data['max_distance'] = max(old_max, current_distance)
-                            if self.pinch_data['min_distance'] != old_min or self.pinch_data['max_distance'] != old_max:
-                                print(f"🔍 DEBUG: Distance updated - current={current_distance:.1f}, min={self.pinch_data['min_distance']:.1f}, max={self.pinch_data['max_distance']:.1f}")
+                            finger_desc = "fingers" if len(slots) > 2 else "finger"
+                            print(f"🔍 DEBUG: Pinch tracking started - {len(slots)} {finger_desc}, initial_distance={current_distance:.1f}")
                     elif (len(self.active_slots) < self.PINCH_MIN_FINGERS or len(self.active_slots) > self.PINCH_MAX_FINGERS) and self.pinch_data['is_active']:
                         self.pinch_data['is_active'] = False
                         print("🔍 DEBUG: Pinch tracking stopped due to finger count change")
-                    
-                    # Track pinch distance in real-time
-                    if len(self.active_slots) == self.PINCH_MIN_FINGERS and self.pinch_data['is_active']:
+                    if len(self.active_slots) >= self.PINCH_MIN_FINGERS and len(self.active_slots) <= self.PINCH_MAX_FINGERS and self.pinch_data['is_active']:
                         current_distance = self._calculate_distance()
                         if current_distance > 0:
                             old_min = self.pinch_data['min_distance']
@@ -550,7 +530,7 @@ class TouchListener:
             move = math.sqrt((ex-sx)**2 + (ey-sy)**2)
             max_move = max(max_move, move)
         
-        # Check for pinch with vector checks (supports 2 and 3 fingers)
+            # Check for pinch with vector checks (supports 2-5 fingers)
         is_pinch = False
         pinch_type = None
         final_distance = 0.0
@@ -580,16 +560,16 @@ class TouchListener:
                 final_distance = math.sqrt((ex1 - ex2)**2 + (ey1 - ey2)**2)
                 pinch_zoom_direction = None  # Not used for 2-finger
                 
-            elif finger_count == 3:
-                # 3-finger pinch: check if all fingers are moving toward/away from center
+            elif finger_count >= 3:
+                # 3-5 finger pinch: check if all fingers are moving toward/away from center
                 positions = [(self.fingers[slot][2], self.fingers[slot][3]) for slot in slots]
                 start_positions = [(self.fingers[slot][0], self.fingers[slot][1]) for slot in slots]
                 
-                # Calculate center of triangle
-                center_x = sum(x for x, y in positions) / 3
-                center_y = sum(y for x, y in positions) / 3
-                start_center_x = sum(x for x, y in start_positions) / 3
-                start_center_y = sum(y for x, y in start_positions) / 3
+                # Calculate center of polygon
+                center_x = sum(x for x, y in positions) / finger_count
+                center_y = sum(y for x, y in positions) / finger_count
+                start_center_x = sum(x for x, y in start_positions) / finger_count
+                start_center_y = sum(y for x, y in start_positions) / finger_count
                 
                 # Check if all fingers are moving toward or away from center
                 all_converging = True
@@ -608,10 +588,6 @@ class TouchListener:
                     start_vec_x = start_center_x - start_positions[i][0]
                     start_vec_y = start_center_y - start_positions[i][1]
                     
-                    # Vector from end position to center
-                    end_vec_x = center_x - positions[i][0]
-                    end_vec_y = center_y - positions[i][1]
-                    
                     # Check dot product to see if moving toward/away from center
                     if dx * start_vec_x + dy * start_vec_y < 0:
                         all_converging = False
@@ -624,25 +600,24 @@ class TouchListener:
                     end_avg_distance += math.sqrt((positions[i][0] - center_x)**2 + 
                                                (positions[i][1] - center_y)**2)
                 
-                start_avg_distance /= 3
-                end_avg_distance /= 3
+                start_avg_distance /= finger_count
+                end_avg_distance /= finger_count
                 
                 directions_opposing = all_converging or all_diverging
                 final_distance = self._calculate_distance()
                 
                 # Use the average distance from center to determine zoom direction
-                # This is more reliable than the pairwise distance for 3 fingers
+                # This is more reliable than the pairwise distance for 3+ fingers
                 if end_avg_distance > start_avg_distance:
                     pinch_zoom_direction = 'ZOOM_OUT'
                 else:
-                    pinch_zoom_direction = 'ZOOM_IN'
-            
+                    pinch_zoom_direction = 'ZOOM_IN'            
             distance_change = abs(self.pinch_data['max_distance'] - self.pinch_data['min_distance'])
             min_change = self.pinch_data['initial_distance'] * (self.PINCH_MIN_CHANGE_PERCENT / 100)
             
             if distance_change >= min_change and directions_opposing:
                 is_pinch = True
-                if finger_count == 3:
+                if finger_count >= 3:
                     # Use the more reliable direction determined from center distances
                     pinch_type = pinch_zoom_direction
                 else:
@@ -1060,8 +1035,8 @@ class TouchListener:
             x1, y1 = self.fingers[slots[0]][2], self.fingers[slots[0]][3]
             x2, y2 = self.fingers[slots[1]][2], self.fingers[slots[1]][3]
             return math.sqrt((x1 - x2)**2 + (y1 - y2)**2)
-        elif finger_count == 3:
-            # 3-finger pinch: use average distance between all pairs
+        elif finger_count >= 3:
+            # 3-5 finger pinch: use average distance between all pairs
             positions = [(self.fingers[slot][2], self.fingers[slot][3]) for slot in slots]
             distances = []
             for i in range(len(positions)):
