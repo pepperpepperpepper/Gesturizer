@@ -29,6 +29,9 @@ class TouchListener:
         self.current_slot = 0
         self.slot_data = {}
         
+        # Complete finger path storage for Douglas-Peucker algorithm
+        self.finger_paths = {}  # slot -> list of {'x', 'y', 't', 'slot'}
+        
         # Hold and drag tracking
         self.active_holds = {}
         self.gesture_hold_state = {
@@ -163,6 +166,10 @@ class TouchListener:
             self.active_holds.pop(slot, None)
             self.motion_stop_tracking.pop(slot, None)
             
+            # Clean up path storage for this finger
+            if slot in self.finger_paths:
+                del self.finger_paths[slot]
+            
             if not self.active_slots:
                 # Check if we had a drag and hold that was confirmed
                 if self.gesture_drag_hold_state['is_drag_hold']:
@@ -186,6 +193,9 @@ class TouchListener:
         self.slot_data[slot] = {'x': 0, 'y': 0}
         self.fingers[slot] = (0, 0, 0, 0, time.time())
         self.active_slots.add(slot)
+        
+        # Initialize path storage for this finger
+        self.finger_paths[slot] = []
         
         # Initialize gesture hold state if first finger
         if len(self.active_slots) == 1:
@@ -228,6 +238,15 @@ class TouchListener:
                     self.fingers[slot] = (sx, sy, new_ex, new_ey, st)
                     self.gesture_detector.track_motion(slot, new_ex, new_ey)
                     
+                    # Store complete path data for Douglas-Peucker
+                    if slot in self.finger_paths:
+                        self.finger_paths[slot].append({
+                            'x': float(new_ex),
+                            'y': float(new_ey),
+                            't': time.time(),
+                            'slot': slot
+                        })
+                    
                     # Update motion stop tracking if significant movement
                     if slot in self.motion_stop_tracking:
                         last_x = self.motion_stop_tracking[slot]['last_x']
@@ -261,6 +280,15 @@ class TouchListener:
                     new_ey = value
                     self.fingers[slot] = (sx, sy, new_ex, new_ey, st)
                     self.gesture_detector.track_motion(slot, new_ex, new_ey)
+                    
+                    # Store complete path data for Douglas-Peucker
+                    if slot in self.finger_paths:
+                        self.finger_paths[slot].append({
+                            'x': float(new_ex),
+                            'y': float(new_ey),
+                            't': time.time(),
+                            'slot': slot
+                        })
                     
                     # Update motion stop tracking if significant movement
                     if slot in self.motion_stop_tracking:
@@ -390,14 +418,22 @@ class TouchListener:
         if not self.fingers:
             return
         
+        # Skip processing if this is a drag and hold that was already confirmed
+        if self.gesture_drag_hold_state['is_drag_hold'] and self.gesture_drag_hold_state['notified']:
+            return
+        
+        # Skip processing if this is a hold that was already confirmed
+        if self.gesture_hold_state['is_hold'] and self.gesture_hold_state['notified']:
+            return
+        
         gesture = self.gesture_detector.classify_gesture(
             self.fingers,
             is_hold=self.gesture_hold_state['is_hold'],
             is_drag_hold=self.gesture_drag_hold_state['is_drag_hold']
         )
         
-        # Only log the gesture if it's not a hold (hold is logged separately)
-        if gesture.get('type') != 'hold':
+        # Only log the gesture if it's not a hold or drag_hold (these are logged separately)
+        if gesture.get('type') not in ['hold', 'drag_hold']:
             self.logger.log_gesture(gesture)
         
         # Clean up motion history
@@ -434,6 +470,9 @@ class TouchListener:
         """Reset gesture state after processing."""
         self.fingers.clear()
         self.active_slots.clear()
+        
+        # Clean up all path storage
+        self.finger_paths.clear()
         
         # Reset hold states but keep the timing info for next gesture
         self.gesture_hold_state = {
