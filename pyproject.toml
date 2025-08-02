@@ -1,13 +1,14 @@
 [tool.poetry]
 name = "touchscreen-events"
-version = "0.1.0"
-description = "Bare-bones touchscreen event listener for Linux"
+version = "2.0.0"
+description = "A modular touchscreen event listener for gesture recognition"
 authors = ["Your Name <your.email@example.com>"]
 readme = "README.md"
-packages = [{include = "tl.py"}]
+packages = [{include = "touchscreen_listener"}]
 
 [tool.poetry.scripts]
-tl = "tl:main"
+tl = "touchscreen_listener.core.listener:main"
+main = "main:main"
 
 [tool.poetry.dependencies]
 python = "^3.8"
