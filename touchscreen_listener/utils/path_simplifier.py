@@ -10,17 +10,7 @@ import time
 from typing import List, Tuple, Optional
 
 
-class Point:
-    """Represents a 2D point with optional timestamp."""
-    
-    def __init__(self, x: float, y: float, timestamp: Optional[float] = None):
-        self.x = x
-        self.y = y
-        self.t = timestamp or time.time()
-        self.timestamp = self.t  # Alias for compatibility
-    
-    def __repr__(self):
-        return f"Point({self.x:.1f}, {self.y:.1f})"
+from .gesture_utils import Point
 
 
 class DouglasPeucker:
