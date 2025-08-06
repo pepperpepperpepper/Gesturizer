@@ -29,68 +29,39 @@ class GestureTemplate:
     
     def _resample_points(self, points: List[Point], num_points: int = 64) -> List[Point]:
         """Resample points to have equal spacing."""
-        if len(points) < 2:
-            # Handle edge case: single point or empty
-            if len(points) == 1:
-                return [points[0]] * num_points
-            else:
-                # Empty case - return center point
-                return [Point(0, 0)] * num_points
-            
+        if len(points) <= 1:
+            return [points[0]] * num_points if points else [Point(0, 0)] * num_points
+
         total_length = self._path_length(points)
         if total_length == 0:
-            # Handle zero-length paths (all points are the same)
-            if points:
-                return [points[0]] * num_points
-            else:
-                return [Point(0, 0)] * num_points
-            
-        interval = total_length / (num_points - 1) if num_points > 1 else 0
+            return [points[0]] * num_points
+
+        interval = total_length / (num_points - 1)
+        D = 0.0
         resampled = [points[0]]
-        current_distance = 0.0
-        
-        # Create a copy of points to avoid modifying original
-        remaining_points = points[1:]
-        
-        # Handle edge case where we have only 2 points but need more samples
-        if len(remaining_points) == 1 and len(points) == 2:
-            # Linear interpolation between the two points
-            p1, p2 = points[0], points[1]
-            for i in range(1, num_points):
-                ratio = i / (num_points - 1)
-                new_x = p1.x + ratio * (p2.x - p1.x)
-                new_y = p1.y + ratio * (p2.y - p1.y)
-                resampled.append(Point(new_x, new_y))
-            return resampled
-        
-        while len(resampled) < num_points and remaining_points:
-            prev_point = resampled[-1]
-            curr_point = remaining_points[0]
-            
-            distance = math.sqrt((curr_point.x - prev_point.x) ** 2 + 
-                             (curr_point.y - prev_point.y) ** 2)
-            
-            # Handle zero distance between consecutive points
-            if distance == 0:
-                remaining_points.pop(0)
-                continue
-                
-            if current_distance + distance >= interval:
-                # Calculate new point
-                ratio = (interval - current_distance) / distance
-                new_x = prev_point.x + ratio * (curr_point.x - prev_point.x)
-                new_y = prev_point.y + ratio * (curr_point.y - prev_point.y)
-                resampled.append(Point(new_x, new_y))
-                current_distance = 0.0
-            else:
-                current_distance += distance
-                remaining_points.pop(0)
-        
-        # Fill remaining points with the last point if needed
-        while len(resampled) < num_points:
-            resampled.append(resampled[-1] if resampled else points[-1])
-            
-        return resampled[:num_points]
+        i = 1
+        while i < len(points):
+            curr_point = points[i]
+            prev_point = points[i-1]
+            d = math.sqrt((curr_point.x - prev_point.x) ** 2 + (curr_point.y - prev_point.y) ** 2)
+            if d > 0:
+                if D + d >= interval:
+                    ratio = (interval - D) / d
+                    qx = prev_point.x + ratio * (curr_point.x - prev_point.x)
+                    qy = prev_point.y + ratio * (curr_point.y - prev_point.y)
+                    q = Point(qx, qy)
+                    resampled.append(q)
+                    points.insert(i, q)  # insert q at i
+                    D = 0.0
+                else:
+                    D += d
+            i += 1
+
+        # Add last point if needed due to rounding
+        if len(resampled) == num_points - 1:
+            resampled.append(points[-1])
+
+        return resampled
     
     def _path_length(self, points: List[Point]) -> float:
         """Calculate total path length."""
@@ -114,7 +85,7 @@ class GestureTemplate:
         return GeometryUtils.rotate_points(points, angle)
     
     def _scale_to_square(self, points: List[Point], size: float = 250.0) -> List[Point]:
-        """Scale points to fit within a square."""
+        """Scale points non-uniformly to fit within a square, matching original $1 algorithm."""
         min_x = min(p.x for p in points)
         max_x = max(p.x for p in points)
         min_y = min(p.y for p in points)
@@ -126,6 +97,7 @@ class GestureTemplate:
         if width == 0 or height == 0:
             return points
             
+        # Non-uniform scaling as per original $1 algorithm
         scaled = []
         for point in points:
             new_x = point.x * (size / width)
@@ -151,64 +123,31 @@ class DollarRecognizer:
     def __init__(self):
         self.templates: List[GestureTemplate] = []
         # Use global config instead of instance threshold
-        self._load_default_templates()
-        self._load_json_templates()
-        self._add_geometric_templates()
+        self._load_json_templates()  # Then load any custom JSON templates
     
-    def _load_default_templates(self):
-        """Load default gesture templates including geometric shapes."""
-        # Simple gesture templates
-        templates = {
-            'gesture': [
-                # Quick swipe right
-                [Point(0, 0), Point(50, 0), Point(100, 0)],
-                # Quick swipe down
-                [Point(0, 0), Point(0, 50), Point(0, 100)],
-                # Quick diagonal
-                [Point(0, 0), Point(50, 50), Point(100, 100)],
-                # Quick circle-like gesture
-                [Point(0, 0), Point(10, 10), Point(20, 5), Point(30, 0), Point(25, -10), Point(15, -15), Point(5, -10), Point(0, 0)],
-            ],
-            'drawing': [
-                # Slow circle (more points, smoother)
-                [Point(0, 0), Point(5, 2), Point(10, 3), Point(15, 3), Point(20, 2), Point(25, 0), Point(27, -5), Point(25, -10), Point(20, -15), Point(15, -17), Point(10, -15), Point(5, -10), Point(0, 0)],
-                # Complex shape
-                [Point(0, 0), Point(10, 5), Point(20, 15), Point(30, 25), Point(25, 35), Point(15, 30), Point(5, 20), Point(0, 10)],
-            ]
-        }
+    def _load_js_templates(self):
+        """Load the exact 16 templates from JavaScript $1 recognizer."""
+        js_path = os.path.join(os.path.dirname(__file__), '..', '..', 'js_templates.json')
         
-        for name, gesture_list in templates.items():
-            for i, points in enumerate(gesture_list):
-                self.add_template(f"{name}_{i}", points)
+        # Try to load JS templates from file
+        if os.path.exists(js_path):
+            try:
+                with open(js_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    templates_data = data.get('templates', data)
+                    
+                    for template in templates_data:
+                        name = template['name']
+                        points = [Point(p['x'], p['y']) for p in template['points']]
+                        self.add_template(name, points)
+                    return
+            except Exception as e:
+                print(f"Warning: Could not load JS templates from file: {e}")
     
     def _load_json_templates(self):
         """Load templates from JSON file with error handling."""
         json_path = os.path.join(os.path.dirname(__file__), 'templates.json')
         self.load_templates(json_path)
-    
-    def _add_geometric_templates(self):
-        """Add geometric shape templates (triangle, circle, rectangle, star, heart)."""
-        geometric_templates = {
-            'triangle': [
-                Point(0, -50), Point(-43, 25), Point(43, 25), Point(0, -50)
-            ],
-            'circle': self._generate_circle_points(50, 64),
-            'rectangle': [
-                Point(-50, -25), Point(50, -25), Point(50, 25), Point(-50, 25), Point(-50, -25)
-            ],
-            'star': self._generate_star_points(5, 50, 25),
-            'heart': self._generate_heart_points(),
-            'arrow': [
-                Point(-50, 0), Point(0, -30), Point(20, -15), Point(20, -30), Point(50, 0), 
-                Point(20, 30), Point(20, 15), Point(0, 30), Point(-50, 0)
-            ],
-            'checkmark': [
-                Point(-30, 0), Point(-10, 20), Point(30, -20)
-            ]
-        }
-        
-        for name, points in geometric_templates.items():
-            self.add_template(name, points)
     
     def _generate_circle_points(self, radius: float, num_points: int) -> List[Point]:
         """Generate points for a circle."""
@@ -240,11 +179,19 @@ class DollarRecognizer:
             heart_points.append(Point(x * 2, y * 2))
         return heart_points
     
-    def add_template(self, name: str, points: List[Point]):
-        """Add a new gesture template."""
+    def add_template(self, name: str, points: List[Point]) -> int:
+        """Add a new gesture template, returns count of templates with this name."""
         template = GestureTemplate(name, points)
         self.templates.append(template)
+        
+        # Return count of templates with this name (like JS AddGesture)
+        return sum(1 for t in self.templates if t.name == name)
     
+    def add_gesture(self, name: str, points: List[Point]) -> int:
+        """Add a new gesture template (alias for add_template to match JS API)."""
+        return self.add_template(name, points)
+    
+
     def classify_path(self, path: List[Dict[str, float]]) -> str:
         """
         Classify a path using the $1 Recognizer.
@@ -258,12 +205,13 @@ class DollarRecognizer:
         result, _ = self.classify_with_score(path)
         return result
     
-    def classify_with_score(self, path: List[Dict[str, float]]) -> Tuple[str, float]:
+    def classify_with_score(self, path: List[Dict[str, float]], use_protractor: bool = False) -> Tuple[str, float]:
         """
         Classify a path and return both classification and similarity score.
         
         Args:
             path: List of dicts with 'x', 'y', 't' keys
+            use_protractor: Whether to use Protractor optimization (vector-based cosine distance)
             
         Returns:
             Tuple of (classification, similarity_score)
@@ -282,15 +230,21 @@ class DollarRecognizer:
         best_score = float('inf')
         best_template = None
         
+        print("Calculating scores for templates:")
         for template in self.templates:
-            score = self._distance_at_best_angle(normalized_points, template.points)
+            if use_protractor:
+                score = self._distance_at_best_angle_protractor(normalized_points, template.points)
+            else:
+                score = self._distance_at_best_angle(normalized_points, template.points)
+            print(f"Template {template.name}: distance {score:.4f}")
             if score < best_score:
                 best_score = score
                 best_template = template
+        print(f"Best template: {best_template.name if best_template else 'None'} with distance {best_score:.4f}")
         
         # Convert distance to similarity score (0.0-1.0)
         similarity_score = self._distance_to_similarity(best_score)
-        
+                # Use global config
         if best_template and similarity_score >= config.similarity_threshold:
             # Return the actual template name for geometric shapes
             if best_template.name in ['triangle', 'circle', 'rectangle', 'star', 'heart', 'arrow', 'checkmark']:
@@ -312,29 +266,33 @@ class DollarRecognizer:
         return fallback_type, 0.5  # Medium confidence for fallback
     
     def _distance_to_similarity(self, distance: float) -> float:
-        """Convert distance to similarity score (0.0-1.0)."""
-        # Map distance [0, 50] to similarity [1.0, 0.0] - more sensitive
-        max_distance = 50.0
-        similarity = max(0.0, 1.0 - (distance / max_distance))
+        """Convert distance to similarity score (0.0-1.0) using original $1 formula."""
+        # Original $1 formula: 1.0 - b / HalfDiagonal
+        square_size = 250.0
+        half_diagonal = 0.5 * math.sqrt(square_size * square_size + square_size * square_size)
+        similarity = max(0.0, 1.0 - (distance / half_diagonal))
         return min(1.0, max(0.0, similarity))
     
     def _distance_at_best_angle(self, points: List[Point], template_points: List[Point]) -> float:
         """Find the best angle match using Golden Section Search."""
-        # Golden ratio
-        PHI = (1 + math.sqrt(5)) / 2
+        # Correct golden ratio (≈0.618 instead of ≈1.618)
+        PHI = 0.5 * (-1.0 + math.sqrt(5.0))
         
-        # Search range [-45°, +45°] in radians
+        # Search range [-45°, +45°] in radians (matching original)
         theta_a = -math.pi / 4
         theta_b = math.pi / 4
         
-        # Golden section search
+        # Convergence threshold (2 degrees in radians)
+        threshold = 0.0349
+        
+        # Golden section search with convergence check
         x1 = PHI * theta_a + (1 - PHI) * theta_b
         f1 = self._distance_at_angle(points, template_points, x1)
         
         x2 = (1 - PHI) * theta_a + PHI * theta_b
         f2 = self._distance_at_angle(points, template_points, x2)
         
-        for _ in range(15):  # 15 iterations for good precision
+        while abs(theta_b - theta_a) > threshold:
             if f1 < f2:
                 theta_b = x2
                 x2 = x1
@@ -349,6 +307,51 @@ class DollarRecognizer:
                 f2 = self._distance_at_angle(points, template_points, x2)
         
         return min(f1, f2)
+
+    def _distance_at_best_angle_protractor(self, points: List[Point], template_points: List[Point]) -> float:
+        """Find the best angle match using Protractor optimization (vector-based cosine distance)."""
+        # Vectorize both point sets
+        vector1 = self._vectorize(points)
+        vector2 = self._vectorize(template_points)
+        
+        # Calculate optimal cosine distance
+        distance = self._optimal_cosine_distance(vector1, vector2)
+        return distance
+
+    def _vectorize(self, points: List[Point]) -> List[float]:
+        """Convert points to a normalized vector representation for Protractor."""
+        centroid = self._calculate_centroid(points)
+        
+        # Create vector by subtracting centroid and flattening
+        vector = []
+        for point in points:
+            vector.append(point.x - centroid.x)
+            vector.append(point.y - centroid.y)
+        
+        # Normalize the vector
+        magnitude = math.sqrt(sum(x * x for x in vector))
+        if magnitude > 0:
+            vector = [x / magnitude for x in vector]
+        
+        return vector
+
+    def _optimal_cosine_distance(self, vector1: List[float], vector2: List[float]) -> float:
+        """Calculate optimal cosine distance between two vectors."""
+        if len(vector1) != len(vector2):
+            return float('inf')
+        
+        # Calculate dot product
+        dot_product = sum(a * b for a, b in zip(vector1, vector2))
+        
+        # Clamp to avoid floating point errors
+        dot_product = max(-1.0, min(1.0, dot_product))
+        
+        # Convert to distance (0 = perfect match, 1 = opposite)
+        # Use 1 - |dot_product| to get distance, scaled appropriately
+        distance = 1.0 - abs(dot_product)
+        
+        # Scale to match $1 distance range (roughly 0-100)
+        return distance * 50.0
     
     def _distance_at_angle(self, points: List[Point], template_points: List[Point], angle: float) -> float:
         """Calculate distance at a specific angle."""
@@ -477,9 +480,21 @@ class DollarRecognizer:
         
         # Only update templates if we successfully loaded some
         if loaded_templates:
-            self.templates = []  # Clear existing templates
+            # Don't clear JS templates, just add new ones (like JS AddGesture)
             for name, points in loaded_templates:
-                self.add_template(name, points)
+                # Check if template already exists and replace it
+                existing_idx = None
+                for idx, template in enumerate(self.templates):
+                    if template.name == name:
+                        existing_idx = idx
+                        break
+                
+                if existing_idx is not None:
+                    # Replace existing template
+                    self.templates[existing_idx] = GestureTemplate(name, points)
+                else:
+                    # Add new template
+                    self.add_template(name, points)
             print(f"Successfully loaded {len(loaded_templates)} templates from '{filename}'")
         else:
             print(f"Warning: No valid templates found in '{filename}'")
@@ -489,10 +504,9 @@ class RecognitionConfig:
     """Configuration for recognition sensitivity."""
     
     def __init__(self):
-        self.similarity_threshold = 0.65  # Lowered for easier recognition
+        self.similarity_threshold = 0.85  # Higher threshold for better accuracy
         self.max_distance = 100.0
-        self.golden_section_iterations = 15
-        self.resample_points = 64
+        self.resample_points = 64  # Match original $1 algorithm
         self.rotation_range = math.pi / 4  # 45 degrees
     
     def set_threshold(self, threshold: float):
@@ -541,6 +555,15 @@ class TemplateTrainer:
         
         self.recognizer.add_template(name, averaged_points)
         return True
+    
+    def add_gesture(self, name: str, points: List[Dict[str, float]]) -> int:
+        """Add a single gesture template (matches JS API)."""
+        gesture_points = [Point(p['x'], p['y']) for p in points]
+        return self.recognizer.add_gesture(name, gesture_points)
+    
+    def delete_user_gestures(self) -> int:
+        """Delete all user-defined templates (matches JS API)."""
+        return self.recognizer.delete_user_gestures()
     
     def save_training_data(self, filename: str):
         """Save training data to file."""
