@@ -265,13 +265,14 @@ class DollarRecognizer:
         fallback_type = self._simple_classification(path)
         return fallback_type, 0.5  # Medium confidence for fallback
     
-    def _distance_to_similarity(self, distance: float) -> float:
-        """Convert distance to similarity score (0.0-1.0) using original $1 formula."""
-        # Original $1 formula: 1.0 - b / HalfDiagonal
-        square_size = 250.0
-        half_diagonal = 0.5 * math.sqrt(square_size * square_size + square_size * square_size)
-        similarity = max(0.0, 1.0 - (distance / half_diagonal))
-        return min(1.0, max(0.0, similarity))
+    def _distance_to_similarity(self, distance: float, use_protractor: bool = False) -> float:
+        """Convert distance to similarity score (0.0-1.0)."""
+        if use_protractor:
+            return 1.0 - (distance / (math.pi / 2))
+        else:
+            square_size = 250.0
+            half_diagonal = 0.5 * math.sqrt(square_size ** 2 + square_size ** 2)
+            return 1.0 - (distance / half_diagonal)
     
     def _distance_at_best_angle(self, points: List[Point], template_points: List[Point]) -> float:
         """Find the best angle match using Golden Section Search."""
@@ -339,19 +340,21 @@ class DollarRecognizer:
         """Calculate optimal cosine distance between two vectors."""
         if len(vector1) != len(vector2):
             return float('inf')
-        
-        # Calculate dot product
-        dot_product = sum(a * b for a, b in zip(vector1, vector2))
-        
-        # Clamp to avoid floating point errors
-        dot_product = max(-1.0, min(1.0, dot_product))
-        
-        # Convert to distance (0 = perfect match, 1 = opposite)
-        # Use 1 - |dot_product| to get distance, scaled appropriately
-        distance = 1.0 - abs(dot_product)
-        
-        # Scale to match $1 distance range (roughly 0-100)
-        return distance * 50.0
+
+        a = 0.0
+        b = 0.0
+        for i in range(0, len(vector1), 2):
+            a += vector1[i] * vector2[i] + vector1[i + 1] * vector2[i + 1]
+            b += vector1[i] * vector2[i + 1] - vector1[i + 1] * vector2[i]
+
+        if a == 0.0:
+            angle = math.pi / 2 if b > 0 else -math.pi / 2
+        else:
+            angle = math.atan(b / a)
+
+        opt_dot = a * math.cos(angle) + b * math.sin(angle)
+        opt_dot = max(-1.0, min(1.0, opt_dot))
+        return math.acos(opt_dot)
     
     def _distance_at_angle(self, points: List[Point], template_points: List[Point], angle: float) -> float:
         """Calculate distance at a specific angle."""
